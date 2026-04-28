@@ -85,6 +85,1183 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const lerp = (a, b, t) => a + (b - a) * t;
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 
+// Audio assets folder. MP3s referenced by dialogue audioId are loaded from here.
+// Relative path so the demo works from any deploy URL (file://, GitHub Pages, etc.)
+const AUDIO_BASE_URL = "audio/";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VOICE / TEXT-TO-SPEECH ENGINE
+// Uses the browser's built-in SpeechSynthesis API. Free, offline-capable
+// after first load, and works in all modern browsers.
+//
+// Per-character profiles tune pitch/rate/voice so PIXEL, NOVA and CIPHER
+// sound distinct. The system gracefully no-ops if speech is unavailable.
+// ═══════════════════════════════════════════════════════════════════════════
+const VoiceEngine = {
+  muted: false,
+  voices: [],
+  ready: false,
+  currentUtterance: null,
+  currentAudio: null,
+
+  // Voice profiles — chosen for personality fit:
+  //   PIXEL: warm, energetic, slightly higher pitch (excited helper)
+  //   NOVA:  medium-fast, witty, mid pitch (signal operator)
+  //   CIPHER: calm, deliberate, lower pitch (wise vault keeper)
+  //   NARRATOR / default: neutral
+  //
+  // preferKeywords are tried in order. We prioritize Apple's premium voices
+  // (much higher quality than defaults) and Google's wavenet-quality voices.
+  profiles: {
+    PIXEL:    {
+      pitch: 1.35, rate: 1.10,
+      preferKeywords: [
+        "samantha", "ava", "allison", "susan", "joanna", "karen", // Apple premium-tier female
+        "google us english", "google uk english female",          // Google high-quality
+        "microsoft zira", "microsoft jenny",                      // Windows decent female
+        "female",                                                 // generic fallback
+      ],
+      gender: "female"
+    },
+    NOVA:     {
+      pitch: 1.05, rate: 1.18,
+      preferKeywords: [
+        "tom", "alex", "fred", "aaron", "evan",                   // Apple premium-tier male
+        "google uk english male", "google us english",            // Google
+        "microsoft mark", "microsoft david",                      // Windows decent male
+        "male",
+      ],
+      gender: "male"
+    },
+    CIPHER:   {
+      pitch: 0.85, rate: 0.92,
+      preferKeywords: [
+        "daniel", "oliver", "thomas", "rishi",                    // Apple premium deeper male
+        "google uk english male",
+        "microsoft david", "microsoft mark",
+        "male",
+      ],
+      gender: "male"
+    },
+    NARRATOR: {
+      pitch: 1.0, rate: 1.0,
+      preferKeywords: [
+        "tom", "alex", "samantha", "ava",                         // Apple premium
+        "google us english", "google uk english",
+        "microsoft mark", "microsoft zira",
+      ],
+      gender: "any"
+    },
+  },
+
+  init() {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    const load = () => {
+      this.voices = window.speechSynthesis.getVoices() || [];
+      this.ready = this.voices.length > 0;
+    };
+    load();
+    // Voices load async on some browsers; listen for the event
+    if (!this.ready) {
+      window.speechSynthesis.addEventListener("voiceschanged", load);
+    }
+    // Restore mute state from localStorage if available
+    try {
+      const saved = window.localStorage?.getItem("lyf_muted");
+      if (saved === "1") this.muted = true;
+    } catch (e) { /* localStorage may be blocked */ }
+  },
+
+  // Find the best voice for a character, preferring English voices that
+  // match the personality keywords. Premium/Enhanced voices are preferred
+  // over defaults — these are dramatically higher quality on Apple devices.
+  findVoice(character) {
+    if (!this.voices || this.voices.length === 0) return null;
+    const profile = this.profiles[character] || this.profiles.NARRATOR;
+    // Filter to English voices first
+    const englishVoices = this.voices.filter((v) =>
+      v.lang && v.lang.toLowerCase().startsWith("en")
+    );
+    const pool = englishVoices.length > 0 ? englishVoices : this.voices;
+
+    // Score each voice: keyword match + premium quality bonus
+    const scored = pool.map((v) => {
+      const name = (v.name || "").toLowerCase();
+      let score = 0;
+      // Keyword match — earlier in list = higher score
+      for (let i = 0; i < profile.preferKeywords.length; i++) {
+        if (name.includes(profile.preferKeywords[i].toLowerCase())) {
+          score += (profile.preferKeywords.length - i) * 10;
+          break;
+        }
+      }
+      // Premium / Enhanced / Neural voices are MUCH better quality
+      if (name.includes("premium") || name.includes("enhanced") || name.includes("neural")) {
+        score += 50;
+      }
+      // Avoid known low-quality voices
+      if (name.includes("espeak") || name.includes("compact")) {
+        score -= 100;
+      }
+      // Avoid novelty voices (Cellos, Bells, etc. on macOS)
+      const novelty = ["albert", "bahh", "bells", "boing", "bubbles", "cellos", "deranged", "good news", "hysterical", "jester", "organ", "superstar", "trinoids", "whisper", "wobble", "zarvox"];
+      if (novelty.some(n => name.includes(n))) score -= 200;
+      return { voice: v, score };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    // Return highest-scoring voice
+    return scored[0]?.voice || pool[0] || null;
+  },
+
+  speak(text, character = "NARRATOR", onEnd = null, audioUrl = null) {
+    if (this.muted) {
+      if (onEnd) onEnd();
+      return;
+    }
+    // Stop anything currently playing (audio or TTS)
+    this.cancel();
+    // Duck background music while voice plays
+    if (typeof MusicEngine !== "undefined") MusicEngine.duck(0.25);
+    const wrappedEnd = () => {
+      if (typeof MusicEngine !== "undefined") MusicEngine.unduck();
+      if (onEnd) onEnd();
+    };
+    // If an audioUrl is provided, try to play it first.
+    // If it fails to load (404, network error, format unsupported), fall back to TTS.
+    if (audioUrl) {
+      this._playAudioWithFallback(audioUrl, text, character, wrappedEnd);
+      return;
+    }
+    // No audio URL — go straight to TTS
+    this._speakTTS(text, character, wrappedEnd);
+  },
+
+  // Try to play an MP3 / OGG / WAV file. On any failure (404, network, decode),
+  // fall back to TTS speaking the same text.
+  _playAudioWithFallback(audioUrl, fallbackText, character, onEnd) {
+    if (typeof Audio === "undefined") {
+      this._speakTTS(fallbackText, character, onEnd);
+      return;
+    }
+    let fellBack = false;
+    const fallback = (reason) => {
+      if (fellBack) return;
+      fellBack = true;
+      // Log once but don't spam
+      // (silent in production — fallback should be invisible to user)
+      this._speakTTS(fallbackText, character, onEnd);
+    };
+    try {
+      const audio = new Audio(audioUrl);
+      audio.preload = "auto";
+      audio.volume = 1.0;
+      // Track this so cancel() can stop it
+      this.currentAudio = audio;
+      let ended = false;
+      audio.onended = () => {
+        if (ended) return;
+        ended = true;
+        if (this.currentAudio === audio) this.currentAudio = null;
+        if (onEnd) onEnd();
+      };
+      audio.onerror = () => fallback("error");
+      // Sometimes audio fails silently; set a load timeout
+      const loadTimeout = setTimeout(() => {
+        if (audio.readyState === 0) fallback("timeout");
+      }, 2500);
+      audio.oncanplaythrough = () => clearTimeout(loadTimeout);
+      // Attempt playback. On modern browsers without prior interaction this
+      // can throw NotAllowedError — fall back to TTS in that case.
+      const playPromise = audio.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(() => fallback("play-rejected"));
+      }
+    } catch (e) {
+      fallback("exception");
+    }
+  },
+
+  _speakTTS(text, character, onEnd) {
+    if (typeof window === "undefined" || !window.speechSynthesis) {
+      if (onEnd) onEnd();
+      return;
+    }
+    // Preprocess for TTS:
+    // 1. Strip emoji and special characters
+    // 2. Lowercase ALL-CAPS words (so "TAP" gets spoken, not "T-A-P")
+    // 3. Expand common abbreviations
+    let clean = text
+      .replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}\u{1F000}-\u{1F02F}\u{1F100}-\u{1F1FF}\u{2700}-\u{27BF}]/gu, "")
+      .replace(/\b([A-Z]{2,})\b/g, (match) => {
+        const keepAcronyms = ["NPC", "AI", "FBI", "USA", "URL"];
+        if (keepAcronyms.includes(match)) return match;
+        return match.toLowerCase();
+      })
+      .replace(/&/g, " and ")
+      .replace(/\$(\d)/g, "$1 dollars")
+      .replace(/(\d)%/g, "$1 percent")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!clean) {
+      if (onEnd) onEnd();
+      return;
+    }
+    const utter = new SpeechSynthesisUtterance(clean);
+    const profile = this.profiles[character] || this.profiles.NARRATOR;
+    utter.pitch = profile.pitch;
+    utter.rate = profile.rate;
+    utter.volume = 1.0;
+    const voice = this.findVoice(character);
+    if (voice) utter.voice = voice;
+    utter.onend = () => {
+      this.currentUtterance = null;
+      if (onEnd) onEnd();
+    };
+    utter.onerror = () => {
+      this.currentUtterance = null;
+      if (onEnd) onEnd();
+    };
+    this.currentUtterance = utter;
+    try {
+      window.speechSynthesis.speak(utter);
+    } catch (e) {
+      if (onEnd) onEnd();
+    }
+  },
+
+  cancel() {
+    // Stop any playing MP3
+    if (this.currentAudio) {
+      try {
+        this.currentAudio.pause();
+        this.currentAudio.currentTime = 0;
+      } catch (e) { /* ignore */ }
+      this.currentAudio = null;
+    }
+    // Stop any TTS speech
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) { /* ignore */ }
+    }
+    this.currentUtterance = null;
+    // Unduck music since voice is no longer playing
+    if (typeof MusicEngine !== "undefined") MusicEngine.unduck();
+  },
+
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.muted) this.cancel();
+    try {
+      window.localStorage?.setItem("lyf_muted", this.muted ? "1" : "0");
+    } catch (e) { /* ignore */ }
+    return this.muted;
+  },
+
+  isMuted() {
+    return this.muted;
+  },
+
+  // Returns true if voice (audio or TTS) is currently playing.
+  // Useful for queuing: callers can check this and decide whether to interrupt
+  // or skip queueing a new line that would step on the current one.
+  isPlaying() {
+    if (this.currentAudio && !this.currentAudio.paused && !this.currentAudio.ended) return true;
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) return true;
+    }
+    return !!this.currentUtterance;
+  },
+};
+
+// Initialize once on module load
+if (typeof window !== "undefined") {
+  VoiceEngine.init();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MUSIC ENGINE
+// Procedural music synthesized via the Web Audio API — original compositions
+// inspired by John Williams (Star Wars) and Koji Kondo (Zelda), but written
+// from scratch with original melodies and chord progressions.
+//
+// Each track has:
+//   - bpm           — tempo
+//   - key           — root note frequency (Hz)
+//   - mode          — major/minor/lydian intervals
+//   - chordProg     — chord progression (degrees) over the loop
+//   - melody        — original melodic phrase, pentatonic-friendly
+//   - bassPattern   — repeating bass figure
+//   - drumPattern   — kick/hi-hat pattern (subtle, not aggressive)
+//
+// The composer sequences these into a seamless loop with crossfades between
+// tracks when phase changes. MP3s in audio/music/ override procedural when
+// they exist (same fallback pattern as voice).
+// ═══════════════════════════════════════════════════════════════════════════
+const MUSIC_BASE_URL = "audio/music/";
+
+const MusicEngine = {
+  ctx: null,                  // AudioContext (lazy)
+  masterGain: null,           // overall volume + mute
+  duckGain: null,             // ducks when voice plays (smoothed)
+  reverbBus: null,            // wet reverb send (ConvolverNode)
+  dryBus: null,               // dry signal pass-through
+  preReverbGain: null,        // gain into reverb (~0.18)
+  preDryGain: null,           // gain into dry path (~0.85)
+  // Active track instance (null when nothing is playing).
+  // Old tracks during crossfade are kept in `fadingOut` until they self-clean.
+  active: null,               // { name, gainNode, loopTimer, cancelled, voicesByName }
+  fadingOut: [],              // [{ name, gainNode, loopTimer, cancelled, fadeUntil }]
+  currentTrack: null,         // name of the track that *should* be playing
+  volume: 0.4,
+  muted: false,
+  ducking: false,
+  duckTarget: 1.0,
+  duckCurrent: 1.0,
+
+  // ─── Music theory ────────────────────────────────────────────────────────
+  semitone(base, n) { return base * Math.pow(2, n / 12); },
+  modes: {
+    major:  [0, 2, 4, 5, 7, 9, 11],
+    minor:  [0, 2, 3, 5, 7, 8, 10],
+    lydian: [0, 2, 4, 6, 7, 9, 11],
+    dorian: [0, 2, 3, 5, 7, 9, 10],
+  },
+  freq(track, degree, octave = 0) {
+    const intervals = this.modes[track.mode];
+    const idx = ((degree - 1) % 7 + 7) % 7;
+    const wraps = Math.floor((degree - 1) / 7);
+    return this.semitone(track.key, intervals[idx] + (octave + wraps) * 12);
+  },
+
+  // ─── Tracks (compositions) ───────────────────────────────────────────────
+  // Voices reference instrument presets defined further down.
+  // Note shape: { deg, oct, beat, dur, vel? } — vel default 1.0
+  tracks: {
+    title: {
+      bpm: 88, key: 220, mode: "major", loopBeats: 16,
+      chordProg: [
+        { deg: 1, oct: 0, beats: 4 },
+        { deg: 5, oct: 0, beats: 4 },
+        { deg: 6, oct: 0, beats: 4 },
+        { deg: 4, oct: 0, beats: 4 },
+      ],
+      melody: [
+        { deg: 5, oct: 1, beat: 0,    dur: 1.5 },
+        { deg: 6, oct: 1, beat: 1.5,  dur: 0.5 },
+        { deg: 5, oct: 1, beat: 2,    dur: 1   },
+        { deg: 3, oct: 1, beat: 3,    dur: 1   },
+        { deg: 2, oct: 1, beat: 4,    dur: 2   },
+        { deg: 5, oct: 1, beat: 6,    dur: 1   },
+        { deg: 6, oct: 1, beat: 7,    dur: 1   },
+        { deg: 1, oct: 2, beat: 8,    dur: 1.5 },
+        { deg: 7, oct: 1, beat: 9.5,  dur: 0.5 },
+        { deg: 6, oct: 1, beat: 10,   dur: 1.5 },
+        { deg: 5, oct: 1, beat: 11.5, dur: 0.5 },
+        { deg: 3, oct: 1, beat: 12,   dur: 2   },
+        { deg: 2, oct: 1, beat: 14,   dur: 1   },
+        { deg: 1, oct: 1, beat: 15,   dur: 1   },
+      ],
+      bassPattern: [
+        { offsetBeats: 0, degOffset: 0, oct: -2, dur: 2 },
+        { offsetBeats: 2, degOffset: 4, oct: -2, dur: 2 },
+      ],
+      lead: "strings_warm",
+      pad:  "strings_pad",
+      bass: "cello_pizz",
+    },
+
+    cinematic: {
+      bpm: 116, key: 293.66, mode: "major", loopBeats: 16,
+      chordProg: [
+        { deg: 1, oct: 0, beats: 4 },
+        { deg: 4, oct: 0, beats: 4 },
+        { deg: 5, oct: 0, beats: 4 },
+        { deg: 1, oct: 0, beats: 4 },
+      ],
+      melody: [
+        { deg: 5, oct: 0, beat: 0,    dur: 1   },
+        { deg: 1, oct: 1, beat: 1,    dur: 1   },
+        { deg: 3, oct: 1, beat: 2,    dur: 0.5 },
+        { deg: 5, oct: 1, beat: 2.5,  dur: 0.5 },
+        { deg: 6, oct: 1, beat: 3,    dur: 1   },
+        { deg: 5, oct: 1, beat: 4,    dur: 1   },
+        { deg: 4, oct: 1, beat: 5,    dur: 1   },
+        { deg: 3, oct: 1, beat: 6,    dur: 1   },
+        { deg: 2, oct: 1, beat: 7,    dur: 1   },
+        { deg: 5, oct: 1, beat: 8,    dur: 1   },
+        { deg: 6, oct: 1, beat: 9,    dur: 1   },
+        { deg: 1, oct: 2, beat: 10,   dur: 2   },
+        { deg: 7, oct: 1, beat: 12,   dur: 1   },
+        { deg: 6, oct: 1, beat: 13,   dur: 1   },
+        { deg: 5, oct: 1, beat: 14,   dur: 1   },
+        { deg: 1, oct: 1, beat: 15,   dur: 1   },
+      ],
+      bassPattern: [
+        { offsetBeats: 0, degOffset: 0, oct: -2, dur: 1 },
+        { offsetBeats: 1, degOffset: 0, oct: -2, dur: 1 },
+        { offsetBeats: 2, degOffset: 4, oct: -2, dur: 1 },
+        { offsetBeats: 3, degOffset: 0, oct: -2, dur: 1 },
+      ],
+      lead: "brass_heroic",
+      pad:  "strings_pad",
+      bass: "cello_legato",
+      subBass: true,           // octave-down doubling for that movie-trailer low end
+    },
+
+    mission1: {
+      bpm: 128, key: 329.63, mode: "minor", loopBeats: 16,
+      chordProg: [
+        { deg: 1, oct: 0, beats: 4 },
+        { deg: 6, oct: 0, beats: 4 },
+        { deg: 3, oct: 0, beats: 4 },
+        { deg: 7, oct: 0, beats: 4 },
+      ],
+      melody: [
+        { deg: 1, oct: 1, beat: 0,    dur: 0.5 },
+        { deg: 3, oct: 1, beat: 0.5,  dur: 0.5 },
+        { deg: 5, oct: 1, beat: 1,    dur: 0.5 },
+        { deg: 3, oct: 1, beat: 1.5,  dur: 0.5 },
+        { deg: 1, oct: 1, beat: 2,    dur: 1   },
+        { deg: 7, oct: 0, beat: 3,    dur: 1   },
+        { deg: 6, oct: 1, beat: 4,    dur: 0.5 },
+        { deg: 5, oct: 1, beat: 4.5,  dur: 0.5 },
+        { deg: 3, oct: 1, beat: 5,    dur: 1   },
+        { deg: 1, oct: 1, beat: 6,    dur: 2   },
+        { deg: 3, oct: 1, beat: 8,    dur: 0.5 },
+        { deg: 5, oct: 1, beat: 8.5,  dur: 0.5 },
+        { deg: 7, oct: 1, beat: 9,    dur: 1   },
+        { deg: 5, oct: 1, beat: 10,   dur: 1   },
+        { deg: 3, oct: 1, beat: 11,   dur: 1   },
+        { deg: 2, oct: 1, beat: 12,   dur: 1   },
+        { deg: 1, oct: 1, beat: 13,   dur: 1   },
+        { deg: 7, oct: 0, beat: 14,   dur: 2   },
+      ],
+      bassPattern: [
+        { offsetBeats: 0,   degOffset: 0, oct: -2, dur: 0.5 },
+        { offsetBeats: 0.5, degOffset: 0, oct: -2, dur: 0.5 },
+        { offsetBeats: 1,   degOffset: 4, oct: -2, dur: 0.5 },
+        { offsetBeats: 1.5, degOffset: 0, oct: -2, dur: 0.5 },
+        { offsetBeats: 2,   degOffset: 0, oct: -2, dur: 0.5 },
+        { offsetBeats: 2.5, degOffset: 0, oct: -2, dur: 0.5 },
+        { offsetBeats: 3,   degOffset: 4, oct: -2, dur: 0.5 },
+        { offsetBeats: 3.5, degOffset: 0, oct: -2, dur: 0.5 },
+      ],
+      lead: "strings_staccato",
+      pad:  "strings_pad",
+      bass: "cello_pizz",
+    },
+
+    mission2: {
+      bpm: 140, key: 369.99, mode: "minor", loopBeats: 16,
+      chordProg: [
+        { deg: 1, oct: 0, beats: 4 },
+        { deg: 7, oct: 0, beats: 4 },
+        { deg: 6, oct: 0, beats: 4 },
+        { deg: 5, oct: 0, beats: 4 },
+      ],
+      melody: [
+        { deg: 1, oct: 1, beat: 0,    dur: 0.25 },
+        { deg: 3, oct: 1, beat: 0.5,  dur: 0.25 },
+        { deg: 5, oct: 1, beat: 0.75, dur: 0.5  },
+        { deg: 7, oct: 1, beat: 1.5,  dur: 0.5  },
+        { deg: 5, oct: 1, beat: 2,    dur: 0.25 },
+        { deg: 3, oct: 1, beat: 2.5,  dur: 0.25 },
+        { deg: 1, oct: 1, beat: 3,    dur: 1    },
+        { deg: 7, oct: 1, beat: 4.5,  dur: 0.5  },
+        { deg: 5, oct: 1, beat: 5,    dur: 0.5  },
+        { deg: 6, oct: 1, beat: 6,    dur: 1    },
+        { deg: 5, oct: 1, beat: 7,    dur: 1    },
+        { deg: 1, oct: 1, beat: 8,    dur: 0.5  },
+        { deg: 3, oct: 1, beat: 8.5,  dur: 0.5  },
+        { deg: 5, oct: 1, beat: 9,    dur: 0.5  },
+        { deg: 1, oct: 2, beat: 9.5,  dur: 1    },
+        { deg: 7, oct: 1, beat: 10.5, dur: 0.5  },
+        { deg: 5, oct: 1, beat: 11,   dur: 1    },
+        { deg: 3, oct: 1, beat: 12,   dur: 1    },
+        { deg: 2, oct: 1, beat: 13,   dur: 1    },
+        { deg: 1, oct: 1, beat: 14,   dur: 2    },
+      ],
+      bassPattern: [
+        { offsetBeats: 0,    degOffset: 0, oct: -2, dur: 0.25 },
+        { offsetBeats: 0.25, degOffset: 0, oct: -2, dur: 0.25 },
+        { offsetBeats: 0.5,  degOffset: 4, oct: -2, dur: 0.25 },
+        { offsetBeats: 1,    degOffset: 0, oct: -2, dur: 0.25 },
+        { offsetBeats: 1.5,  degOffset: 4, oct: -2, dur: 0.5  },
+        { offsetBeats: 2,    degOffset: 0, oct: -2, dur: 0.25 },
+        { offsetBeats: 2.5,  degOffset: 0, oct: -2, dur: 0.25 },
+        { offsetBeats: 3,    degOffset: 4, oct: -2, dur: 0.5  },
+        { offsetBeats: 3.5,  degOffset: 0, oct: -2, dur: 0.5  },
+      ],
+      lead: "strings_staccato",
+      pad:  "strings_pad",
+      bass: "cello_pizz",
+    },
+
+    mission3: {
+      bpm: 80, key: 293.66, mode: "lydian", loopBeats: 16,
+      chordProg: [
+        { deg: 1, oct: 0, beats: 4 },
+        { deg: 5, oct: 0, beats: 4 },
+        { deg: 4, oct: 0, beats: 4 },
+        { deg: 1, oct: 0, beats: 4 },
+      ],
+      melody: [
+        { deg: 1, oct: 1, beat: 0,   dur: 2   },
+        { deg: 3, oct: 1, beat: 2,   dur: 1   },
+        { deg: 5, oct: 1, beat: 3,   dur: 1   },
+        { deg: 4, oct: 1, beat: 4,   dur: 3   },
+        { deg: 3, oct: 1, beat: 7,   dur: 1   },
+        { deg: 5, oct: 1, beat: 8,   dur: 2   },
+        { deg: 6, oct: 1, beat: 10,  dur: 1   },
+        { deg: 5, oct: 1, beat: 11,  dur: 1   },
+        { deg: 3, oct: 1, beat: 12,  dur: 2   },
+        { deg: 2, oct: 1, beat: 14,  dur: 1   },
+        { deg: 1, oct: 1, beat: 15,  dur: 1   },
+      ],
+      bassPattern: [
+        { offsetBeats: 0, degOffset: 0, oct: -2, dur: 2 },
+        { offsetBeats: 2, degOffset: 4, oct: -2, dur: 2 },
+      ],
+      lead: "harp",
+      pad:  "strings_pad",
+      bass: "cello_legato",
+    },
+
+    victory: {
+      bpm: 108, key: 261.63, mode: "major", loopBeats: 16,
+      chordProg: [
+        { deg: 1, oct: 0, beats: 4 },
+        { deg: 4, oct: 0, beats: 4 },
+        { deg: 5, oct: 0, beats: 4 },
+        { deg: 1, oct: 0, beats: 4 },
+      ],
+      melody: [
+        { deg: 5, oct: 0, beat: 0,    dur: 0.5 },
+        { deg: 1, oct: 1, beat: 0.5,  dur: 0.5 },
+        { deg: 3, oct: 1, beat: 1,    dur: 0.5 },
+        { deg: 5, oct: 1, beat: 1.5,  dur: 0.5 },
+        { deg: 1, oct: 2, beat: 2,    dur: 2   },
+        { deg: 6, oct: 1, beat: 4,    dur: 1   },
+        { deg: 5, oct: 1, beat: 5,    dur: 1   },
+        { deg: 4, oct: 1, beat: 6,    dur: 1   },
+        { deg: 3, oct: 1, beat: 7,    dur: 1   },
+        { deg: 5, oct: 1, beat: 8,    dur: 0.5 },
+        { deg: 6, oct: 1, beat: 8.5,  dur: 0.5 },
+        { deg: 7, oct: 1, beat: 9,    dur: 0.5 },
+        { deg: 1, oct: 2, beat: 9.5,  dur: 2.5 },
+        { deg: 7, oct: 1, beat: 12,   dur: 0.5 },
+        { deg: 5, oct: 1, beat: 12.5, dur: 0.5 },
+        { deg: 3, oct: 1, beat: 13,   dur: 1   },
+        { deg: 1, oct: 1, beat: 14,   dur: 2   },
+      ],
+      bassPattern: [
+        { offsetBeats: 0, degOffset: 0, oct: -2, dur: 1 },
+        { offsetBeats: 1, degOffset: 4, oct: -2, dur: 1 },
+        { offsetBeats: 2, degOffset: 0, oct: -2, dur: 1 },
+        { offsetBeats: 3, degOffset: 4, oct: -2, dur: 1 },
+      ],
+      lead: "brass_heroic",
+      pad:  "strings_pad",
+      bass: "cello_legato",
+      subBass: true,
+      brassSwell: true,        // brass chord swells on each downbeat — triumphant
+    },
+  },
+
+  // ─── Instruments ─────────────────────────────────────────────────────────
+  // Each instrument is a function (track, freq, startTime, duration, velocity)
+  // that schedules one or more oscillators with envelopes + filters to mimic
+  // a real instrument. All output goes through `dest` (the track gain node).
+  //
+  // Why these matter: layering detuned oscillators + filtering + reverb is the
+  // difference between "Game Boy bleep" and "small chamber ensemble." It's not
+  // a real orchestra, but it's a real step up from monophonic synth.
+
+  // Warm sustained strings (violas + violins doubled, soft attack)
+  _strings_warm(freq, t0, dur, vel, dest) {
+    const ctx = this.ctx;
+    const gain = ctx.createGain();
+    const peak = 0.085 * vel;
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + 0.18);                   // soft attack
+    gain.gain.linearRampToValueAtTime(peak * 0.85, t0 + Math.min(0.6, dur * 0.4));
+    gain.gain.linearRampToValueAtTime(peak * 0.7, t0 + dur - 0.15);
+    gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    // Low-pass filter for the rounded "bowed" timbre
+    const filt = ctx.createBiquadFilter();
+    filt.type = "lowpass";
+    filt.frequency.value = 2400;
+    filt.Q.value = 0.6;
+    // 3 detuned sawtooths = ensemble effect
+    [-12, 0, 12].forEach((cents) => {
+      const o = ctx.createOscillator();
+      o.type = "sawtooth";
+      o.frequency.value = freq * Math.pow(2, cents / 1200);
+      o.connect(filt);
+      o.start(t0);
+      o.stop(t0 + dur + 0.05);
+    });
+    // Subtle vibrato on the upper voice
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 5;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = freq * 0.003;
+    lfo.connect(lfoGain);
+    filt.connect(gain);
+    gain.connect(dest);
+    lfo.start(t0);
+    lfo.stop(t0 + dur + 0.05);
+  },
+
+  // Pad: very soft sustained strings, no attack transient — pure swell
+  _strings_pad(freq, t0, dur, vel, dest) {
+    const ctx = this.ctx;
+    const gain = ctx.createGain();
+    const peak = 0.045 * vel;
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + Math.min(0.6, dur * 0.3));
+    gain.gain.setValueAtTime(peak, t0 + dur - 0.4);
+    gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    const filt = ctx.createBiquadFilter();
+    filt.type = "lowpass";
+    filt.frequency.value = 1800;
+    filt.Q.value = 0.4;
+    [-15, -3, 3, 15].forEach((cents) => {
+      const o = ctx.createOscillator();
+      o.type = "sawtooth";
+      o.frequency.value = freq * Math.pow(2, cents / 1200);
+      o.connect(filt);
+      o.start(t0);
+      o.stop(t0 + dur + 0.05);
+    });
+    filt.connect(gain);
+    gain.connect(dest);
+  },
+
+  // Heroic brass — bright, with quick attack, harmonically rich
+  _brass_heroic(freq, t0, dur, vel, dest) {
+    const ctx = this.ctx;
+    const gain = ctx.createGain();
+    const peak = 0.13 * vel;
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + 0.06);
+    gain.gain.linearRampToValueAtTime(peak * 0.75, t0 + 0.3);
+    gain.gain.setValueAtTime(peak * 0.7, t0 + Math.max(0.3, dur - 0.15));
+    gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    // Brass uses BANDPASS for that "trumpet formant"
+    const filt = ctx.createBiquadFilter();
+    filt.type = "lowpass";
+    filt.frequency.value = 3200;
+    filt.Q.value = 1.2;
+    // Layered: square (fundamental + odd harmonics) + sawtooth (richness)
+    [
+      { type: "square",   detune: 0,   gain: 0.5 },
+      { type: "sawtooth", detune: 4,   gain: 0.7 },
+      { type: "sawtooth", detune: -4,  gain: 0.7 },
+    ].forEach((v) => {
+      const o = ctx.createOscillator();
+      o.type = v.type;
+      o.frequency.value = freq;
+      o.detune.value = v.detune;
+      const g = ctx.createGain();
+      g.gain.value = v.gain;
+      o.connect(g);
+      g.connect(filt);
+      o.start(t0);
+      o.stop(t0 + dur + 0.05);
+    });
+    filt.connect(gain);
+    gain.connect(dest);
+  },
+
+  // Staccato strings — short, articulated for action sections
+  _strings_staccato(freq, t0, dur, vel, dest) {
+    const ctx = this.ctx;
+    const gain = ctx.createGain();
+    const peak = 0.10 * vel;
+    // Very short articulation regardless of nominal duration — short bow strokes
+    const articDur = Math.min(dur * 0.85, 0.22);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + articDur);
+    gain.gain.setValueAtTime(0, t0 + articDur);
+    const filt = ctx.createBiquadFilter();
+    filt.type = "lowpass";
+    filt.frequency.value = 2800;
+    filt.Q.value = 0.7;
+    [-7, 7].forEach((cents) => {
+      const o = ctx.createOscillator();
+      o.type = "sawtooth";
+      o.frequency.value = freq * Math.pow(2, cents / 1200);
+      o.connect(filt);
+      o.start(t0);
+      o.stop(t0 + articDur + 0.02);
+    });
+    filt.connect(gain);
+    gain.connect(dest);
+  },
+
+  // Pizzicato cello — plucked, short with character
+  _cello_pizz(freq, t0, dur, vel, dest) {
+    const ctx = this.ctx;
+    const gain = ctx.createGain();
+    const peak = 0.16 * vel;
+    const articDur = Math.min(dur * 0.7, 0.35);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + articDur);
+    gain.gain.setValueAtTime(0, t0 + articDur);
+    const filt = ctx.createBiquadFilter();
+    filt.type = "lowpass";
+    filt.frequency.value = 1400;
+    filt.Q.value = 1.0;
+    const o1 = ctx.createOscillator();
+    o1.type = "triangle";
+    o1.frequency.value = freq;
+    o1.connect(filt);
+    o1.start(t0);
+    o1.stop(t0 + articDur + 0.02);
+    // Octave-up sawtooth for "pluck" brightness, very short
+    const o2 = ctx.createOscillator();
+    o2.type = "sawtooth";
+    o2.frequency.value = freq * 2;
+    const o2Gain = ctx.createGain();
+    o2Gain.gain.setValueAtTime(0.4, t0);
+    o2Gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.08);
+    o2.connect(o2Gain);
+    o2Gain.connect(filt);
+    o2.start(t0);
+    o2.stop(t0 + 0.1);
+    filt.connect(gain);
+    gain.connect(dest);
+  },
+
+  // Sustained cello (legato bowed bass)
+  _cello_legato(freq, t0, dur, vel, dest) {
+    const ctx = this.ctx;
+    const gain = ctx.createGain();
+    const peak = 0.14 * vel;
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + 0.1);
+    gain.gain.linearRampToValueAtTime(peak * 0.8, t0 + dur - 0.15);
+    gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    const filt = ctx.createBiquadFilter();
+    filt.type = "lowpass";
+    filt.frequency.value = 1500;
+    filt.Q.value = 0.8;
+    [0, 8, -8].forEach((cents) => {
+      const o = ctx.createOscillator();
+      o.type = "sawtooth";
+      o.frequency.value = freq * Math.pow(2, cents / 1200);
+      o.connect(filt);
+      o.start(t0);
+      o.stop(t0 + dur + 0.05);
+    });
+    filt.connect(gain);
+    gain.connect(dest);
+  },
+
+  // Harp — plucked, sparkling, decays naturally
+  _harp(freq, t0, dur, vel, dest) {
+    const ctx = this.ctx;
+    const gain = ctx.createGain();
+    const peak = 0.11 * vel;
+    const decayDur = Math.min(dur, 1.6);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + decayDur);
+    gain.gain.setValueAtTime(0, t0 + decayDur);
+    const filt = ctx.createBiquadFilter();
+    filt.type = "lowpass";
+    filt.frequency.value = 3500;
+    filt.Q.value = 0.4;
+    // Triangle fundamental + sine octave-up for sparkle
+    const o1 = ctx.createOscillator();
+    o1.type = "triangle";
+    o1.frequency.value = freq;
+    o1.connect(filt);
+    o1.start(t0);
+    o1.stop(t0 + decayDur + 0.02);
+    const o2 = ctx.createOscillator();
+    o2.type = "sine";
+    o2.frequency.value = freq * 2;
+    const o2g = ctx.createGain();
+    o2g.gain.setValueAtTime(0.3, t0);
+    o2g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.4);
+    o2.connect(o2g);
+    o2g.connect(filt);
+    o2.start(t0);
+    o2.stop(t0 + 0.5);
+    filt.connect(gain);
+    gain.connect(dest);
+  },
+
+  // ─── Reverb (synthesized impulse response) ──────────────────────────────
+  // Generates a pseudo-random decaying noise burst that, when convolved with
+  // the dry signal, simulates a small concert hall. Computed once at init.
+  _makeReverbBuffer() {
+    const ctx = this.ctx;
+    if (!ctx) return null;
+    const sampleRate = ctx.sampleRate;
+    const seconds = 1.6;          // reverb tail length
+    const length = Math.floor(seconds * sampleRate);
+    const buffer = ctx.createBuffer(2, length, sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = buffer.getChannelData(ch);
+      for (let i = 0; i < length; i++) {
+        // Exponential decay envelope on top of noise
+        const env = Math.pow(1 - i / length, 2.5);
+        data[i] = (Math.random() * 2 - 1) * env;
+      }
+    }
+    return buffer;
+  },
+
+  // ─── Engine lifecycle ────────────────────────────────────────────────────
+  init() {
+    try {
+      const v = window.localStorage?.getItem("lyf_music_volume");
+      if (v !== null) this.volume = parseFloat(v);
+      const m = window.localStorage?.getItem("lyf_music_muted");
+      if (m === "1") this.muted = true;
+    } catch (e) {}
+  },
+
+  ensureContext() {
+    if (this.ctx) return this.ctx;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      this.ctx = new AC();
+      // Bus structure:
+      //   per-track gain → splits to dryBus and reverbBus
+      //   dryBus    → preDryGain   → duckGain → masterGain → destination
+      //   reverbBus → ConvolverNode → preReverbGain → duckGain → masterGain → destination
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = this.muted ? 0 : this.volume;
+      this.masterGain.connect(this.ctx.destination);
+      this.duckGain = this.ctx.createGain();
+      this.duckGain.gain.value = 1.0;
+      this.duckGain.connect(this.masterGain);
+      this.preDryGain = this.ctx.createGain();
+      this.preDryGain.gain.value = 0.85;
+      this.preDryGain.connect(this.duckGain);
+      const conv = this.ctx.createConvolver();
+      conv.buffer = this._makeReverbBuffer();
+      this.preReverbGain = this.ctx.createGain();
+      this.preReverbGain.gain.value = 0.20;
+      conv.connect(this.preReverbGain);
+      this.preReverbGain.connect(this.duckGain);
+      this.dryBus = this.preDryGain;
+      this.reverbBus = conv;
+      // Smooth duck animation loop
+      const tickDuck = () => {
+        if (this.duckGain) {
+          this.duckCurrent += (this.duckTarget - this.duckCurrent) * 0.08;
+          try { this.duckGain.gain.value = this.duckCurrent; } catch (e) {}
+        }
+        requestAnimationFrame(tickDuck);
+      };
+      requestAnimationFrame(tickDuck);
+    } catch (e) {
+      this.ctx = null;
+    }
+    return this.ctx;
+  },
+
+  // ─── Public API ──────────────────────────────────────────────────────────
+  play(trackName) {
+    if (this.muted) {
+      this.currentTrack = trackName;
+      return;
+    }
+    // No-op if same track already playing (and actually producing sound)
+    if (this.currentTrack === trackName && this.active && this._isActuallyPlaying()) return;
+    this.currentTrack = trackName;
+    // Try MP3 first (preserved from original implementation)
+    const mp3Url = `${MUSIC_BASE_URL}${trackName}.mp3`;
+    this._tryMp3OrProcedural(trackName, mp3Url);
+  },
+
+  _isActuallyPlaying() {
+    if (this.currentAudio && !this.currentAudio.paused) return true;
+    if (this.active && this.active.loopTimer) return true;
+    return false;
+  },
+
+  _tryMp3OrProcedural(trackName, mp3Url) {
+    if (typeof Audio === "undefined") {
+      this._playProcedural(trackName);
+      return;
+    }
+    let fellBack = false;
+    const fallback = () => {
+      if (fellBack) return;
+      fellBack = true;
+      this._playProcedural(trackName);
+    };
+    try {
+      const audio = new Audio(mp3Url);
+      audio.loop = true;
+      audio.volume = 0;  // start silent, fade in after old track fades out
+      this._fadeOutCurrent();
+      this.currentAudio = audio;
+      audio.onerror = () => fallback();
+      const tm = setTimeout(() => {
+        if (audio.readyState === 0) fallback();
+      }, 1500);
+      audio.oncanplaythrough = () => clearTimeout(tm);
+      const p = audio.play();
+      if (p && p.catch) p.catch(() => fallback());
+      // Start fade-in after a short gap (lets old track exit cleanly)
+      setTimeout(() => {
+        const fadeSteps = 30;
+        const target = this.volume;
+        let step = 0;
+        const fadeIn = setInterval(() => {
+          step++;
+          const ratio = step / fadeSteps;
+          // Exponential-ish ease so fade feels natural
+          const eased = ratio * ratio;
+          if (audio === this.currentAudio) audio.volume = eased * target;
+          if (step >= fadeSteps) clearInterval(fadeIn);
+        }, 33); // ~1s total fade-in
+      }, 600);
+    } catch (e) {
+      fallback();
+    }
+  },
+
+  // Play procedural — fade old track out, brief gap, fade new track in.
+  // The gap (200ms of silence + reverb tail) prevents the harsh
+  // dual-key-overlap sound when crossfading between unrelated tracks.
+  _playProcedural(trackName) {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    if (ctx.state === "suspended") {
+      try { ctx.resume(); } catch (e) {}
+    }
+    const track = this.tracks[trackName];
+    if (!track) return;
+
+    // Fade out current cleanly first
+    this._fadeOutCurrent();
+
+    // New track has its own gain node — starts silent, fades in after a small gap
+    const trackGain = ctx.createGain();
+    trackGain.gain.value = 0;
+    const fadeInStart = ctx.currentTime + 0.55;       // 550ms gap after old fade-out begins
+    const fadeInEnd   = fadeInStart + 1.4;            // 1.4s fade-in (gentle, exponential-style)
+    trackGain.gain.setValueAtTime(0, fadeInStart);
+    // Use exponential-shaped ramp via small target ramps for natural-sounding swell
+    // (true exponentialRamp can't reach 0; we approximate with two stages)
+    trackGain.gain.linearRampToValueAtTime(0.18, fadeInStart + 0.5);
+    trackGain.gain.linearRampToValueAtTime(0.55, fadeInStart + 0.95);
+    trackGain.gain.linearRampToValueAtTime(1.0,  fadeInEnd);
+    // Connect to both buses
+    trackGain.connect(this.dryBus);
+    trackGain.connect(this.reverbBus);
+
+    const instance = {
+      name: trackName,
+      gainNode: trackGain,
+      cancelled: false,
+      loopTimer: null,
+      // Notes start playing slightly into the fade-in so attacks have shape
+      // when the gain reaches them. We accept some quietness on beat 1.
+      startTime: fadeInStart + 0.15,
+    };
+    this.active = instance;
+    this._scheduleLoop(track, instance);
+  },
+
+  _fadeOutCurrent() {
+    if (!this.active) return;
+    const ctx = this.ctx;
+    const old = this.active;
+    this.active = null;
+    if (!ctx || !old.gainNode) {
+      old.cancelled = true;
+      if (old.loopTimer) clearInterval(old.loopTimer);
+      return;
+    }
+    const now = ctx.currentTime;
+    const fadeDuration = 0.5;  // shorter, snappier fade-out
+    try {
+      old.gainNode.gain.cancelScheduledValues(now);
+      // Read current value robustly
+      const currentVal = old.gainNode.gain.value;
+      old.gainNode.gain.setValueAtTime(currentVal, now);
+      // Exponential-ish curve via two-segment linear ramp
+      old.gainNode.gain.linearRampToValueAtTime(currentVal * 0.4, now + fadeDuration * 0.4);
+      old.gainNode.gain.linearRampToValueAtTime(0, now + fadeDuration);
+    } catch (e) {}
+    // Stop scheduling new loop iterations IMMEDIATELY — don't keep adding new notes
+    // that we'd just fade out anyway. Existing already-scheduled notes (from the
+    // last renderLoop call) will play through their envelopes naturally.
+    old.cancelled = true;
+    if (old.loopTimer) {
+      clearInterval(old.loopTimer);
+      old.loopTimer = null;
+    }
+    // Disconnect and free node after fade fully completes (+ reverb tail)
+    setTimeout(() => {
+      try { old.gainNode.disconnect(); } catch (e) {}
+    }, (fadeDuration + 2.5) * 1000);  // extra time for reverb tail to die out
+    this.fadingOut.push(old);
+    // Cleanup old fading entries (keep array bounded)
+    if (this.fadingOut.length > 8) {
+      this.fadingOut = this.fadingOut.slice(-8);
+    }
+  },
+
+  // Schedule the looping pattern. Re-scheduled by setInterval to keep going.
+  _scheduleLoop(track, instance) {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const beat = 60 / track.bpm;
+    const loopDur = track.loopBeats * beat;
+
+    const renderLoop = (startTime) => {
+      if (instance.cancelled || this.active !== instance) return;
+      // Lead melody
+      const leadFn = this["_" + track.lead];
+      if (leadFn) {
+        for (const note of track.melody) {
+          const freq = this.freq(track, note.deg, note.oct);
+          const t0 = startTime + note.beat * beat;
+          // Subtle humanization: ±8% velocity, ±15ms timing jitter
+          const vel = (note.vel || 1) * (0.92 + Math.random() * 0.16);
+          const jitter = (Math.random() - 0.5) * 0.03;
+          leadFn.call(this, freq, t0 + jitter, note.dur * beat, vel, instance.gainNode);
+        }
+      }
+      // Bass
+      const bassFn = this["_" + track.bass];
+      if (bassFn) {
+        let chordStart = 0;
+        for (const chord of track.chordProg) {
+          for (const bn of track.bassPattern) {
+            const freq = this.freq(track, chord.deg + bn.degOffset, chord.oct + bn.oct);
+            const t0 = startTime + (chordStart + bn.offsetBeats) * beat;
+            const vel = 0.92 + Math.random() * 0.16;
+            bassFn.call(this, freq, t0, bn.dur * beat, vel, instance.gainNode);
+            // Optional sub-bass: octave below for orchestral weight
+            // (used by cinematic, victory — gives that movie-trailer low end)
+            if (track.subBass) {
+              const subFreq = this.freq(track, chord.deg + bn.degOffset, chord.oct + bn.oct - 1);
+              bassFn.call(this, subFreq, t0, bn.dur * beat, vel * 0.6, instance.gainNode);
+            }
+          }
+          chordStart += chord.beats;
+        }
+      }
+      // Pad — spread voicing across two octaves for richness
+      const padFn = this["_" + track.pad];
+      if (padFn) {
+        let chordStart = 0;
+        for (const chord of track.chordProg) {
+          const t0 = startTime + chordStart * beat;
+          const padDur = chord.beats * beat;
+          // Voicing: root in one octave, third + fifth in the next
+          padFn.call(this, this.freq(track, chord.deg, chord.oct - 1), t0, padDur, 1.0, instance.gainNode);
+          padFn.call(this, this.freq(track, chord.deg + 2, chord.oct), t0, padDur, 1.0, instance.gainNode);
+          padFn.call(this, this.freq(track, chord.deg + 4, chord.oct), t0, padDur, 1.0, instance.gainNode);
+          // Optional brass swell on chord changes — gives orchestral weight on
+          // accented downbeats (used by cinematic and victory tracks)
+          if (track.brassSwell && this._brass_heroic) {
+            // Brass plays root + 5th, half the chord duration, for a "swell" feel
+            const swellDur = Math.min(padDur * 0.7, 2.0);
+            this._brass_heroic(this.freq(track, chord.deg, chord.oct), t0, swellDur, 0.55, instance.gainNode);
+            this._brass_heroic(this.freq(track, chord.deg + 4, chord.oct), t0, swellDur, 0.5, instance.gainNode);
+          }
+          chordStart += chord.beats;
+        }
+      }
+    };
+
+    const firstStart = (instance && instance.startTime) || (ctx.currentTime + 0.05);
+    renderLoop(firstStart);
+
+    let nextStart = firstStart + loopDur;
+    instance.loopTimer = setInterval(() => {
+      if (instance.cancelled || this.active !== instance) return;
+      renderLoop(nextStart);
+      nextStart += loopDur;
+    }, loopDur * 1000);
+  },
+
+  stop() {
+    this.currentTrack = null;
+    this._fadeOutCurrent();
+    if (this.currentAudio) {
+      const audio = this.currentAudio;
+      this.currentAudio = null;
+      // Fade out the audio element too
+      const startVol = audio.volume;
+      const fadeMs = 800;
+      const startT = performance.now();
+      const fade = () => {
+        const k = Math.min(1, (performance.now() - startT) / fadeMs);
+        try { audio.volume = startVol * (1 - k); } catch (e) {}
+        if (k < 1) requestAnimationFrame(fade);
+        else { try { audio.pause(); audio.currentTime = 0; } catch (e) {} }
+      };
+      fade();
+    }
+  },
+
+  setVolume(v) {
+    this.volume = Math.max(0, Math.min(1, v));
+    try { window.localStorage?.setItem("lyf_music_volume", String(this.volume)); } catch (e) {}
+    if (this.masterGain) this.masterGain.gain.value = this.muted ? 0 : this.volume;
+    if (this.currentAudio) this.currentAudio.volume = this.volume;
+  },
+
+  toggleMute() {
+    this.muted = !this.muted;
+    try { window.localStorage?.setItem("lyf_music_muted", this.muted ? "1" : "0"); } catch (e) {}
+    if (this.masterGain) this.masterGain.gain.value = this.muted ? 0 : this.volume;
+    if (this.currentAudio) {
+      if (this.muted) this.currentAudio.pause();
+      else { try { this.currentAudio.play(); } catch (e) {} }
+    }
+    if (this.muted) {
+      this.stop();
+    } else if (this.currentTrack) {
+      const t = this.currentTrack;
+      this.currentTrack = null;
+      this.play(t);
+    }
+    return this.muted;
+  },
+
+  isMuted() { return this.muted; },
+  duck(amount = 0.3) { this.duckTarget = amount; },
+  unduck() { this.duckTarget = 1.0; },
+};
+
+// Initialize music engine state from localStorage
+if (typeof window !== "undefined") {
+  MusicEngine.init();
+  // Browsers block AudioContext until user interacts. Resume on first click/touch
+  // and retry the current music track if needed.
+  const resumeAudio = () => {
+    if (MusicEngine.ctx && MusicEngine.ctx.state === "suspended") {
+      try { MusicEngine.ctx.resume(); } catch (e) {}
+    }
+    if (MusicEngine.currentTrack && !MusicEngine._isActuallyPlaying() && !MusicEngine.muted) {
+      // Retry the current track
+      const t = MusicEngine.currentTrack;
+      MusicEngine.currentTrack = null;
+      MusicEngine.play(t);
+    }
+  };
+  window.addEventListener("pointerdown", resumeAudio, { once: false });
+  window.addEventListener("keydown", resumeAudio, { once: false });
+}
+
 // Canvas roundRect polyfill for older browsers
 if (typeof CanvasRenderingContext2D !== "undefined" && !CanvasRenderingContext2D.prototype.roundRect) {
   CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
@@ -165,42 +1342,115 @@ const DEFAULT_AVATAR = {
   accessory: "visor",
 };
 
-// ── NPC DIALOGUE (tight — kids lose interest fast) ────────────────────────
-// Intros: 2 lines (situation + instruction). Wins: 1 line (pure celebration).
-// Deeper lessons live in in-game tooltips, not blocking dialogue.
+// ── NPC DIALOGUE ──────────────────────────────────────────────────────────
+// Each line has:
+//   text      — what's shown visually (caps used for kid-friendly emphasis)
+//   voiceText — same words as text, with punctuation tweaks for TTS pacing
+//   audioId   — ID matching an MP3 in audio/. If file exists, plays instead.
+// Intros: 2 lines (situation + instruction). Wins: 1 line (celebration).
 const dialogue = (name) => ({
   landing: [
-    { npc: "PIXEL", text: `${name}! You made it! I'm PIXEL — the gate is cracking and I need a Guardian!` },
-    { npc: "PIXEL", text: `Glitch Bots are breaking in. Will you help me seal it?` },
+    {
+      audioId: "landing-1",
+      npc: "PIXEL",
+      text: `${name}! You made it! I'm PIXEL — the gate is cracking and I need a Guardian!`,
+      voiceText: `${name}! You made it! I'm Pixel. The gate is cracking, and I need a Guardian!`,
+    },
+    {
+      audioId: "landing-2",
+      npc: "PIXEL",
+      text: `Glitch Bots are breaking in. Will you help me seal it?`,
+      voiceText: `Glitch Bots are breaking in. Will you help me seal it?`,
+    },
   ],
   // ═══ MISSION 1 — PASSWORD FORTRESS ═══════════════════════════════════════
   m1Intro: [
-    { npc: "PIXEL", text: `Passwords are like keys to your house. A strong one needs LETTERS, numbers, and symbols!` },
-    { npc: "PIXEL", text: `TAP the Glitch Bots to grab their password-shards and seal the gate!` },
+    {
+      audioId: "m1-intro-1",
+      npc: "PIXEL",
+      text: `Passwords are like keys to your house. A strong one needs LETTERS, numbers, and symbols!`,
+      voiceText: `Passwords are like keys to your house. A strong one needs letters, numbers, and symbols!`,
+    },
+    {
+      audioId: "m1-intro-2",
+      npc: "PIXEL",
+      text: `TAP the Glitch Bots to grab their password-shards and seal the gate!`,
+      voiceText: `Tap the Glitch Bots to grab their password shards, and seal the gate!`,
+    },
   ],
   m1Win: [
-    { npc: "PIXEL", text: `GATE SEALED! ${name}, you're AMAZING! 🎉` },
+    {
+      audioId: "m1-win-1",
+      npc: "PIXEL",
+      text: `GATE SEALED! ${name}, you're AMAZING! 🎉`,
+      voiceText: `Gate sealed! ${name}, you're amazing!`,
+    },
   ],
   // ═══ MISSION 2 — MESSAGE FLOOD (LASER SWORD) ═════════════════════════════
   m2Intro: [
-    { npc: "NOVA", text: `${name}! Fake messages are flooding the tower — they pretend to be nice but they're traps!` },
-    { npc: "NOVA", text: `SLASH the red trap messages with your laser sword. Let the green safe ones through!` },
+    {
+      audioId: "m2-intro-1",
+      npc: "NOVA",
+      text: `${name}! Fake messages are flooding the tower — they pretend to be nice but they're traps!`,
+      voiceText: `${name}! Fake messages are flooding the tower. They pretend to be nice, but they're traps!`,
+    },
+    {
+      audioId: "m2-intro-2",
+      npc: "NOVA",
+      text: `SLASH the red trap messages with your laser sword. Let the green safe ones through!`,
+      voiceText: `Slash the red trap messages with your laser sword. Let the green safe ones through!`,
+    },
   ],
   m2Win: [
-    { npc: "NOVA", text: `TOWER CLEAR! ${name}, that was LEGENDARY sword work! ⚔️` },
+    {
+      audioId: "m2-win-1",
+      npc: "NOVA",
+      text: `TOWER CLEAR! ${name}, that was LEGENDARY sword work! ⚔️`,
+      voiceText: `Tower clear! ${name}, that was legendary sword work!`,
+    },
   ],
   // ═══ MISSION 3 — DATA VAULT LOCK ═════════════════════════════════════════
   m3Intro: [
-    { npc: "CIPHER", text: `Guardian. PRIVATE things like your address are treasure maps — DRAG them to the VAULT 🔒.` },
-    { npc: "CIPHER", text: `PUBLIC things like favorite color are safe to share — DRAG them to OPEN 🌍.` },
+    {
+      audioId: "m3-intro-1",
+      npc: "CIPHER",
+      text: `Guardian. PRIVATE things like your address are treasure maps — DRAG them to the VAULT 🔒.`,
+      voiceText: `Guardian. Private things, like your address, are treasure maps. Drag them to the vault.`,
+    },
+    {
+      audioId: "m3-intro-2",
+      npc: "CIPHER",
+      text: `PUBLIC things like favorite color are safe to share — DRAG them to OPEN 🌍.`,
+      voiceText: `Public things, like favorite color, are safe to share. Drag them to open.`,
+    },
   ],
   m3Win: [
-    { npc: "CIPHER", text: `The vault is sealed, Guardian. Cyberia is safe because of you. 🛡️` },
+    {
+      audioId: "m3-win-1",
+      npc: "CIPHER",
+      text: `The vault is sealed, Guardian. Cyberia is safe because of you. 🛡️`,
+      voiceText: `The vault is sealed, Guardian. Cyberia is safe, because of you.`,
+    },
   ],
   finale: [
-    { npc: "PIXEL", text: `${name}! You fixed the gate AND stopped the flood AND sealed the vault!` },
-    { npc: "NOVA", text: `The whole city is cheering for you! 🎉` },
-    { npc: "CIPHER", text: `You are Cyberia's first Guardian. We will never forget this day.` },
+    {
+      audioId: "finale-1",
+      npc: "PIXEL",
+      text: `${name}! You fixed the gate AND stopped the flood AND sealed the vault!`,
+      voiceText: `${name}! You fixed the gate, and stopped the flood, and sealed the vault!`,
+    },
+    {
+      audioId: "finale-2",
+      npc: "NOVA",
+      text: `The whole city is cheering for you! 🎉`,
+      voiceText: `The whole city is cheering for you!`,
+    },
+    {
+      audioId: "finale-3",
+      npc: "CIPHER",
+      text: `You are Cyberia's first Guardian. We will never forget this day.`,
+      voiceText: `You are Cyberia's first Guardian. We will never forget this day.`,
+    },
   ],
 });
 
@@ -1373,6 +2623,30 @@ function CyberiaGame() {
 
   const d = useMemo(() => dialogue(playerName || "Guardian"), [playerName]);
 
+  // Phase-driven music — switches tracks as the game progresses
+  useEffect(() => {
+    const musicMap = {
+      "start":             "title",
+      "opening-crawl":     "title",
+      "landing-cinematic": "cinematic",
+      "avatar-lab":        "title",
+      "landing":           "title",
+      "m1-intro":          "mission1",
+      "m1-play":           "mission1",
+      "m1-win":            "victory",
+      "m2-intro":          "mission2",
+      "m2-play":           "mission2",
+      "m2-win":            "victory",
+      "m3-intro":          "mission3",
+      "m3-play":           "mission3",
+      "m3-win":            "victory",
+      "finale":            "victory",
+      "complete":          "victory",
+    };
+    const track = musicMap[phase];
+    if (track) MusicEngine.play(track);
+  }, [phase]);
+
   function startLanding() {
     if (!nameInput.trim()) return;
     setPlayerName(nameInput.trim().slice(0, 12));
@@ -1425,6 +2699,7 @@ function CyberiaGame() {
   return (
     <div style={styles.root}>
       <style>{globalCss}</style>
+      <AudioControls />
 
       {phase === "start" && (
         <StartScreen
@@ -1640,11 +2915,13 @@ function StartScreen({ nameInput, setNameInput, onStart }) {
 // ═══════════════════════════════════════════════════════════════════════════
 const CRAWL_LINES = [
   {
+    audioId: "crawl-1",
     text: "In a universe made of dreams and data, three worlds teach the skills every kid needs...",
     duration: 4200,
     style: "body",
   },
   {
+    audioId: "crawl-harmonia",
     text: "HARMONIA",
     subtitle: "where feelings become melodies.",
     duration: 3200,
@@ -1652,6 +2929,7 @@ const CRAWL_LINES = [
     color: "#ff6fb5",
   },
   {
+    audioId: "crawl-financia",
     text: "FINANCIA",
     subtitle: "where every coin is a choice.",
     duration: 3200,
@@ -1659,6 +2937,7 @@ const CRAWL_LINES = [
     color: "#ffd36b",
   },
   {
+    audioId: "crawl-cyberia",
     text: "CYBERIA",
     subtitle: "a world of data and guardians... now under attack.",
     duration: 3600,
@@ -1666,11 +2945,13 @@ const CRAWL_LINES = [
     color: "#4de8ff",
   },
   {
+    audioId: "crawl-call",
     text: "Cyberia needs a Guardian.",
     duration: 2600,
     style: "call",
   },
   {
+    audioId: "crawl-final",
     text: "Someone like YOU.",
     duration: 3000,
     style: "final",
@@ -1681,23 +2962,77 @@ function OpeningCrawl({ playerName, onComplete }) {
   const [lineIdx, setLineIdx] = useState(0);
   const [skippable, setSkippable] = useState(false);
   const canvasRef = useRef(null);
+  const cancelledRef = useRef(false);
 
-  // Timed advance through lines
+  // Voice-driven advance: each line plays to completion, then we advance.
+  // The line's `duration` field acts as a MINIMUM display time so visuals
+  // don't flash by; lines never cut off voice mid-sentence.
   useEffect(() => {
-    const skipT = setTimeout(() => setSkippable(true), 800);
-    let elapsed = 0;
-    const timers = [];
-    for (let i = 0; i < CRAWL_LINES.length; i++) {
-      const showAt = elapsed;
-      timers.push(setTimeout(() => setLineIdx(i), showAt));
-      elapsed += CRAWL_LINES[i].duration;
+    cancelledRef.current = false;
+    // Show skip button after a brief moment so kids see it but it doesn't dominate
+    const skipT = setTimeout(() => setSkippable(true), 600);
+
+    let activeTimer = null;
+    function playLine(idx) {
+      if (cancelledRef.current) return;
+      if (idx >= CRAWL_LINES.length) {
+        // All lines spoken — give a brief pause then complete
+        activeTimer = setTimeout(() => {
+          if (!cancelledRef.current) onComplete();
+        }, 600);
+        return;
+      }
+      setLineIdx(idx);
+      const line = CRAWL_LINES[idx];
+      let toSpeak = line.text;
+      if (line.style === "final") {
+        toSpeak = toSpeak.replace("YOU", playerName);
+      }
+      if (line.subtitle) {
+        toSpeak = `${line.text}. ${line.subtitle}`;
+      }
+      const audioUrl = line.audioId ? `${AUDIO_BASE_URL}${line.audioId}.mp3` : null;
+      const startTime = performance.now();
+      // Minimum display time before we'll advance, even if voice finishes quickly
+      const minDisplay = Math.min(line.duration, 2200);
+      // Safety net: if the voice engine never fires onEnd (browser quirk,
+      // muted state, missing voices on first paint), advance after a max
+      // wait so we never get stuck on a line.
+      let advanced = false;
+      const advance = () => {
+        if (advanced || cancelledRef.current) return;
+        advanced = true;
+        const elapsed = performance.now() - startTime;
+        const remaining = Math.max(0, minDisplay - elapsed);
+        activeTimer = setTimeout(() => {
+          if (!cancelledRef.current) playLine(idx + 1);
+        }, remaining);
+      };
+      // Hard cap: even if voice somehow never returns, advance after this.
+      // 8s is plenty for any single crawl line.
+      const safetyTimer = setTimeout(advance, 8000);
+      VoiceEngine.speak(toSpeak, "NARRATOR", () => {
+        clearTimeout(safetyTimer);
+        advance();
+      }, audioUrl);
     }
-    const doneT = setTimeout(() => onComplete(), elapsed + 400);
+    // Kick off the chain
+    playLine(0);
+
     return () => {
-      clearTimeout(skipT); clearTimeout(doneT);
-      timers.forEach((t) => clearTimeout(t));
+      cancelledRef.current = true;
+      clearTimeout(skipT);
+      if (activeTimer) clearTimeout(activeTimer);
+      VoiceEngine.cancel();
     };
-  }, [onComplete]);
+  }, [onComplete, playerName]);
+
+  // Skip handler — cancels everything cleanly and jumps to next phase
+  function handleSkip() {
+    cancelledRef.current = true;
+    VoiceEngine.cancel();
+    onComplete();
+  }
 
   // Canvas background: deep-space nebula with drifting planets + parallax stars
   useEffect(() => {
@@ -1886,7 +3221,7 @@ function OpeningCrawl({ playerName, onComplete }) {
       </div>
 
       {skippable && (
-        <button style={styles.skipBtn} onClick={onComplete}>SKIP ▸</button>
+        <button style={styles.skipBtn} onClick={handleSkip}>SKIP INTRO ▸</button>
       )}
     </div>
   );
@@ -1934,16 +3269,27 @@ function LandingCinematic({ avatarCfg, onComplete }) {
   useEffect(() => {
     // Subtitle timing aligns with the 5 acts (total 26s)
     // Act 1: 0-5s  · Act 2: 5-9s  · Act 3: 9-13s  · Act 4: 13-20s  · Act 5: 20-26s
+    // Visual text is short for readability; voice text is even tighter
+    // so each line fits comfortably within its 3-5 second slot.
     const subs = [
-      { t: 0.5, text: "LYF-1 · APPROACHING CYBERIA" },
-      { t: 5.5, text: "FINAL APPROACH — ATMOSPHERIC INTERFACE" },
-      { t: 9.5, text: "ENTERING ATMOSPHERE — HOLD TIGHT" },
-      { t: 13.5, text: "ENTERING CYBERIA AIRSPACE" },
-      { t: 17, text: "DIGITAL GUARDIANS WELCOME YOU" },
-      { t: 20.5, text: "BEGINNING LANDING SEQUENCE" },
-      { t: 24, text: "TOUCHDOWN" },
+      { t: 0.5,  text: "LYF-1 · APPROACHING CYBERIA",            voice: "Approaching Cyberia.",                    audioId: "cine-1" },
+      { t: 5.5,  text: "FINAL APPROACH — ATMOSPHERIC INTERFACE", voice: "Final approach.",                          audioId: "cine-2" },
+      { t: 9.5,  text: "ENTERING ATMOSPHERE — HOLD TIGHT",       voice: "Entering atmosphere. Hold tight.",         audioId: "cine-3" },
+      { t: 13.5, text: "ENTERING CYBERIA AIRSPACE",              voice: "Entering Cyberia airspace.",               audioId: "cine-4" },
+      { t: 17,   text: "DIGITAL GUARDIANS WELCOME YOU",          voice: "Digital guardians welcome you.",           audioId: "cine-5" },
+      { t: 20.5, text: "BEGINNING LANDING SEQUENCE",             voice: "Beginning landing sequence.",              audioId: "cine-6" },
+      { t: 24,   text: "TOUCHDOWN",                              voice: "Touchdown.",                               audioId: "cine-7" },
     ];
-    const subTimers = subs.map((s) => setTimeout(() => setSubtitle(s.text), s.t * 1000));
+    const subTimers = subs.map((s) => setTimeout(() => {
+      setSubtitle(s.text);
+      const audioUrl = s.audioId ? `${AUDIO_BASE_URL}${s.audioId}.mp3` : null;
+      // If previous voice is still playing, let it finish — don't cut it off.
+      // The visual subtitle still updates so the cinematic stays in sync;
+      // we just skip THIS voice to preserve the previous one.
+      if (!VoiceEngine.isPlaying()) {
+        VoiceEngine.speak(s.voice, "NARRATOR", null, audioUrl);
+      }
+    }, s.t * 1000));
     const skipT = setTimeout(() => setSkippable(true), 500);
     const doneT = setTimeout(() => onComplete(), 26000);
     // Switch from cockpit to chase cam at start of act 4 (city flyby)
@@ -1953,6 +3299,7 @@ function LandingCinematic({ avatarCfg, onComplete }) {
     return () => {
       clearTimeout(skipT); clearTimeout(doneT); clearTimeout(chaseT); clearTimeout(landingT);
       subTimers.forEach((t) => clearTimeout(t));
+      VoiceEngine.cancel();
     };
   }, [onComplete]);
 
@@ -7017,12 +8364,49 @@ function TopHUD({ phase, name }) {
   );
 }
 
+// Global mute toggle — visible on every screen so kids/parents can silence at any time.
+// Audio controls — separate toggles for voice and music. Bottom-right corner.
+function AudioControls() {
+  const [voiceMuted, setVoiceMuted] = useState(VoiceEngine.isMuted());
+  const [musicMuted, setMusicMuted] = useState(MusicEngine.isMuted());
+  function toggleVoice(e) {
+    if (e) e.stopPropagation();
+    setVoiceMuted(VoiceEngine.toggleMute());
+  }
+  function toggleMusic(e) {
+    if (e) e.stopPropagation();
+    setMusicMuted(MusicEngine.toggleMute());
+  }
+  return (
+    <div style={styles.audioControls}>
+      <button
+        onClick={toggleMusic}
+        style={{ ...styles.audioBtn, opacity: musicMuted ? 0.4 : 1 }}
+        aria-label={musicMuted ? "Unmute music" : "Mute music"}
+        title={musicMuted ? "Music OFF — tap to enable" : "Music ON — tap to mute"}
+      >
+        {musicMuted ? "🎵̶" : "🎵"}
+      </button>
+      <button
+        onClick={toggleVoice}
+        style={{ ...styles.audioBtn, opacity: voiceMuted ? 0.4 : 1 }}
+        aria-label={voiceMuted ? "Unmute voices" : "Mute voices"}
+        title={voiceMuted ? "Voice OFF — tap to enable" : "Voice ON — tap to mute"}
+      >
+        {voiceMuted ? "🔇" : "🔊"}
+      </button>
+    </div>
+  );
+}
+
 function DialogueBox({ line, onNext, isLast }) {
   const [shown, setShown] = useState("");
   const [complete, setComplete] = useState(false);
+  const [voiceDone, setVoiceDone] = useState(false);
   useEffect(() => {
     setShown("");
     setComplete(false);
+    setVoiceDone(false);
     let i = 0;
     const iv = setInterval(() => {
       i++;
@@ -7032,8 +8416,21 @@ function DialogueBox({ line, onNext, isLast }) {
         setComplete(true);
       }
     }, 14); // snappier typewriter
-    return () => clearInterval(iv);
-  }, [line.text]);
+    // Speak the line. If an audioId is present, try the MP3 first; the engine
+    // falls back to TTS if the file isn't available. Mark voiceDone when
+    // the audio/TTS finishes naturally so the user knows it's safe to advance.
+    const audioUrl = line.audioId ? `${AUDIO_BASE_URL}${line.audioId}.mp3` : null;
+    VoiceEngine.speak(
+      line.voiceText || line.text,
+      line.npc,
+      () => setVoiceDone(true),
+      audioUrl
+    );
+    return () => {
+      clearInterval(iv);
+      VoiceEngine.cancel();
+    };
+  }, [line.text, line.npc]);
   const npcStyle = {
     PIXEL: { color: COLORS.teal, glow: COLORS.teal },
     NOVA: { color: COLORS.green, glow: COLORS.green },
@@ -7041,15 +8438,28 @@ function DialogueBox({ line, onNext, isLast }) {
   }[line.npc] || { color: COLORS.cyan, glow: COLORS.cyan };
   const icon = { PIXEL: "🤖", NOVA: "📡", CIPHER: "🔮" }[line.npc] || "✦";
 
-  // Tap anywhere on the dialogue to advance (kid-finger-friendly).
-  // If typewriter is still running, first tap completes it instantly.
+  // Tap behavior depends on state:
+  //   1. typewriter still running → tap reveals full text (voice keeps playing uninterrupted)
+  //   2. typewriter done, voice still playing → tap skips voice and advances
+  //   3. both done → tap advances normally
   function handleTap() {
     if (!complete) {
       setShown(line.text);
       setComplete(true);
     } else {
+      VoiceEngine.cancel();
       onNext();
     }
+  }
+
+  // Button label adapts to current state — clear cue what happens on tap
+  let buttonLabel;
+  if (!complete) {
+    buttonLabel = "...";
+  } else if (!voiceDone) {
+    buttonLabel = "Skip voice ⏭";
+  } else {
+    buttonLabel = isLast ? "Let's go! →" : "Tap to continue →";
   }
 
   return (
@@ -7060,13 +8470,21 @@ function DialogueBox({ line, onNext, isLast }) {
             <span style={{ fontSize: 20, marginRight: 8 }}>{icon}</span>
             {line.npc}
           </div>
+          {!voiceDone && complete && (
+            <span style={styles.dialogueSpeakingDot}>● speaking</span>
+          )}
         </div>
         <div style={styles.dialogueText}>{shown}<span style={styles.caret}>{complete ? "" : "▊"}</span></div>
         <button
           onClick={(e) => { e.stopPropagation(); handleTap(); }}
-          style={{ ...styles.nextBtn, borderColor: npcStyle.glow, color: npcStyle.color }}
+          style={{
+            ...styles.nextBtn,
+            borderColor: npcStyle.glow,
+            color: npcStyle.color,
+            opacity: !complete ? 0.5 : 1,
+          }}
         >
-          {isLast ? "Let's go! →" : "Tap to continue →"}
+          {buttonLabel}
         </button>
       </div>
     </div>
@@ -7400,6 +8818,29 @@ const styles = {
     fontFamily: "'Orbitron', sans-serif",
     fontSize: 12, letterSpacing: "0.2em",
     borderRadius: 8, cursor: "pointer",
+  },
+
+  // Voice mute toggle — bottom-right, visible always
+  // Audio controls — voice and music toggles, bottom-right corner
+  audioControls: {
+    position: "fixed",
+    bottom: 16, right: 16,
+    display: "flex",
+    gap: 10,
+    zIndex: 9999,
+  },
+  audioBtn: {
+    width: 46, height: 46,
+    borderRadius: "50%",
+    background: "rgba(10,18,48,0.85)",
+    border: `2px solid ${COLORS.cyan}`,
+    color: COLORS.cyan,
+    fontSize: 22,
+    cursor: "pointer",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    boxShadow: `0 0 16px ${COLORS.cyan}44`,
+    transition: "transform 0.15s, box-shadow 0.15s, opacity 0.15s",
+    padding: 0,
   },
 
   // COCKPIT HUD
